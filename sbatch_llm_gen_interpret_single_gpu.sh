@@ -24,7 +24,7 @@
 MONITOR_PID=$!
 # conda activate data
 # echo "This job ran on $SLURM_NODELIST dated `date`";
-python llm_generation_predict.py --labels resistance_nitrofurantoin &> output_March_22_gen.txt
-# python llm_generation_predict_interpretation.py --labels resistance_nitrofurantoin &> output_March_15_gen_interpret.txt
+# python llm_generation_predict.py --labels resistance_nitrofurantoin &> output_March_15_gen.txt
+python llm_generation_predict_interpretation.py --labels resistance_nitrofurantoin &> output_March_15_gen_interpret.txt
 
 kill $MONITOR_PID

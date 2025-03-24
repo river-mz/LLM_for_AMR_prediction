@@ -19,6 +19,10 @@ from sklearn.metrics import confusion_matrix
 import datetime
 import csv
 import argparse
+import os
+
+output_dir = "./output_march_21/"
+os.makedirs(output_dir,exist_ok = True)
 
 # 参数解析
 parser = argparse.ArgumentParser()
@@ -42,17 +46,18 @@ use_cols = ['age', 'race', 'veteran', 'gender', 'BMI', 'previous_antibiotic_expo
        'Klebsiella_pneumoniae', 'Acinetobacter_baumannii', 'Pseudomonas_aeruginosa', 
        'Enterobacter', 'organism_other', 'organism_NA', 'additional_note']
 
-data = pd.read_csv("/path/to/your/dataset.csv", usecols=use_cols, header=0) 
-data = data.sample(frac=1/50, random_state=42)
+data = pd.read_csv("/ibex/project/c2205/AMR_dataset_peijun/integrate/final_all_additional_note_feb14.csv",  usecols = use_cols, header=0) 
+data = data.sample(frac=1/10, random_state=42)
+# labels_list = ["resistance_nitrofurantoin", "resistance_sulfamethoxazole", "resistance_ciprofloxacin", "resistance_levofloxacin"]
 
 # 特征工程
-features = data.drop(columns=labels_list)
+features = data.drop(columns=["resistance_nitrofurantoin", "resistance_sulfamethoxazole", "resistance_ciprofloxacin", "resistance_levofloxacin"])
 labels = data[labels_list]
 data["input"] = features.apply(lambda row: "; ".join([f"{col.replace('_',' ')}:{val}" for col, val in row.items()]), axis=1)
 
-# 下载模型
-snapshot_download("qwen/Qwen2-1.5B-Instruct", cache_dir="./", revision="master")
-tokenizer = AutoTokenizer.from_pretrained("./qwen/Qwen2-1___5B-Instruct/", use_fast=False, trust_remote_code=True)
+# 下载模型 
+# snapshot_download("qwen/Qwen2-1.5B-Instruct", cache_dir="./", revision="master")
+tokenizer = AutoTokenizer.from_pretrained("../../qwen/Qwen2-1___5B-Instruct/", use_fast=False, trust_remote_code=True)
 tokenizer.padding_side = "left"
 
 # 数据处理函数
@@ -98,7 +103,7 @@ def predict_with_reason(messages, model, tokenizer):
     # 解析响应
     generated_ids = [output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)]
     response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-    
+    print(response)
     # 使用正则表达式提取预测和理由
     prediction, reason = None, ""
     pred_match = re.search(r'Prediction:\s*(\d+)', response, re.IGNORECASE)
@@ -114,6 +119,8 @@ def predict_with_reason(messages, model, tokenizer):
             reason = response.replace(num_match.group(), '', 1).strip()
     
     return prediction, reason
+
+
 
 # 主流程
 for label in labels_list:
@@ -136,7 +143,7 @@ for label in labels_list:
     train_dataset = train_dataset.map(process_func, fn_kwargs={"antibiotics": antimicrobial}, remove_columns=train_dataset.column_names)
 
     # 模型准备
-    model = AutoModelForCausalLM.from_pretrained("./qwen/Qwen2-1___5B-Instruct/", device_map="auto", torch_dtype=torch.bfloat16)
+    model = AutoModelForCausalLM.from_pretrained("../../qwen/Qwen2-1___5B-Instruct/", device_map="auto", torch_dtype=torch.bfloat16)
     model.enable_input_require_grads()
     
     # LoRA配置
@@ -153,9 +160,9 @@ for label in labels_list:
     training_args = TrainingArguments(
         output_dir=f"./output/{antimicrobial}_{datetime.datetime.now().strftime('%Y%m%d%H%M')}",
         per_device_train_batch_size=8,
-        gradient_accumulation_steps=2,
+        gradient_accumulation_steps=1,
         learning_rate=2e-5,
-        num_train_epochs=15,
+        num_train_epochs=20,
         logging_steps=20,
         fp16=True,
         optim="adamw_torch",
@@ -173,7 +180,9 @@ for label in labels_list:
         data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer, padding=True)
     )
     trainer.train()
-    
+
+    model.save_pretrained(os.path.join(output_dir,'model/lora_adapter'), save_adapters_only=True)
+
     # 测试阶段
     predictions = []
     reasons = []
@@ -183,7 +192,8 @@ for label in labels_list:
     test_messages = []
     for x in x_test:
         test_messages.append([
-            {"role": "system", "content": f"You are an antimicrobial resistance expert. Analyze the following case and provide:\n1. Prediction (0 for susceptible, 1 for resistant)\n2. Key factors influencing the prediction"},
+            # {"role": "system", "content": f"You are an antimicrobial resistance expert for {antimicrobial} resistance prediction. Analyze the following case and provide:\n1. Prediction (0 for susceptible, 1 for resistant)\n2. Key factors influencing the prediction"},
+            {"role": "system", "content": f"As an expert in {antimicrobial} resistance prediction, analyze the case and provide:\n1. Prediction: 0 (susceptible) or 1 (resistant)\n2. Reasoning: Key factors influencing the prediction."},
             {"role": "user", "content": f"Patient features: {x}"}
         ])
     
@@ -204,7 +214,7 @@ for label in labels_list:
         "prediction": predictions,
         "reasoning": reasons
     })
-    result_df.to_csv(f"{antimicrobial}_predictions.csv", index=False)
+    result_df.to_csv(os.path.join(output_dir,f"{antimicrobial}_predictions.csv"), index=False)
     
     # 计算指标（过滤无效预测）
     valid_preds = [(t, p) for t, p in zip(y_true, predictions) if p in (0, 1)]
@@ -215,12 +225,13 @@ for label in labels_list:
     y_true_valid, y_pred_valid = zip(*valid_preds)
     cm = confusion_matrix(y_true_valid, y_pred_valid)
     tn, fp, fn, tp = cm.ravel()
-    
+
+
     metrics = {
         "accuracy": (tp + tn) / (tp + tn + fp + fn),
-        "sensitivity": tp / (tp + fn),
+        "recall": tp / (tp + fn),
         "specificity": tn / (tn + fp),
-        "ppv": tp / (tp + fp) if (tp + fp) > 0 else 0,
+        "precision": tp / (tp + fp) if (tp + fp) > 0 else 0,
         "f1": 2*tp / (2*tp + fp + fn)
     }
     

@@ -26,15 +26,19 @@ import pandas as pd
 import csv
 
 import argparse
-
+import re
 parser = argparse.ArgumentParser()
 
 # Add argument for antimicrobial labels
+parser.add_argument('--output_dir', type=str, default = './output_march22_gen_predict', help="Path to the trained model.")
 parser.add_argument('--labels', nargs='+', help='Targeted antimicrobial.')
 args = parser.parse_args()
 labels_list = args.labels
 # labels_list = ["resistance_nitrofurantoin", "resistance_sulfamethoxazole", "resistance_ciprofloxacin", "resistance_levofloxacin"]
 
+
+output_dir = args.output_dir
+os.makedirs(output_dir,exist_ok = True)
 
 # Set seed for reproducibility
 set_seed(42)  
@@ -64,7 +68,7 @@ use_cols = ['age', 'race', 'veteran', 'gender', 'BMI', 'previous_antibiotic_expo
 
 
 data = pd.read_csv("/ibex/project/c2205/AMR_dataset_peijun/integrate/final_all_additional_note_feb14.csv",  usecols = use_cols, header=0) 
-data = data.sample(frac=1/50, random_state=42)  # only use a fraction of dataset for debugging 
+data = data.sample(frac=1/100, random_state=42)  # only use a fraction of dataset for debugging 
 print(data.shape)
 
 
@@ -77,10 +81,10 @@ labels = data[["resistance_nitrofurantoin", "resistance_sulfamethoxazole", "resi
 data["input"] = features.apply(lambda row: "; ".join([f"{col.replace('_',' ')}:{val}" for col, val in row.items()]), axis=1)
 
 # Download Qwen model
-snapshot_download("qwen/Qwen2-1.5B-Instruct", cache_dir="./", revision="master")
+# snapshot_download("qwen/Qwen2-1.5B-Instruct", cache_dir="./", revision="master")
 
 # Loading tokenizer (map words in sentences into index)
-tokenizer = AutoTokenizer.from_pretrained("./qwen/Qwen2-1___5B-Instruct/", use_fast=False, trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained("../../qwen/Qwen2-1___5B-Instruct/", use_fast=False, trust_remote_code=True)
 tokenizer.padding_side = "left"
 
 
@@ -116,26 +120,36 @@ def process_func(example, antibiotics):
     return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
 
-def predict(messages, model, tokenizer):
+def predict_without_reason(messages, model, tokenizer):
     device = "cuda"
     text = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
     model_inputs = tokenizer([text], return_tensors="pt", max_length=318, truncation=True).to(device)
     
-    generated_ids = model.generate(model_inputs.input_ids, max_new_tokens=3)
-    print('input len:')
-    print(len(model_inputs.input_ids))
-    print(model_inputs.input_ids)
-    print('output len:')
-    print(len(generated_ids))
-    print(generated_ids)
-    generated_ids = [
-        output_ids[len(input_ids) :]
-        for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
-    ] 
+    # 生成更长响应
+    generated_ids = model.generate(
+        model_inputs.input_ids,
+        max_new_tokens=100,
+        pad_token_id=tokenizer.pad_token_id,
+        temperature=0.7,
+        top_p=0.9
+    )
+    
+    # 解析响应
+    generated_ids = [output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)]
     response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-    return response
+    # print(response)
+    # 使用正则表达式
+    prediction, reasExtract_fold_metrixs_from_outon = None, ""
+    pred_match = re.search(r'Prediction:\s*(\d+)', response, re.IGNORECASE)
+    if pred_match:
+        prediction = int(pred_match.group(1))
+    else:
+        num_match = re.search(r'\b[01]\b', response)
+        if num_match:
+            prediction = int(num_match.group())
+    return prediction
 
 
 X = []
@@ -189,7 +203,7 @@ for label in labels_list:
     train_dataset = train_ds.map(process_func, fn_kwargs={"antibiotics": antimicrobial}, remove_columns=train_ds.column_names)
 
     # Load the Qwen model
-    Qwen_model = AutoModelForCausalLM.from_pretrained("./qwen/Qwen2-1___5B-Instruct/",device_map="auto",  torch_dtype=torch.bfloat16)
+    Qwen_model = AutoModelForCausalLM.from_pretrained("../../qwen/Qwen2-1___5B-Instruct/",device_map="auto",  torch_dtype=torch.bfloat16)
     Qwen_model.enable_input_require_grads()
 
     # using api in peft (param-effective finetuning)
@@ -224,7 +238,7 @@ for label in labels_list:
         lr_scheduler_type="cosine",
         gradient_accumulation_steps=1,  
         logging_steps=5,
-        num_train_epochs=30,
+        num_train_epochs=5,
         learning_rate=1e-5,
         gradient_checkpointing=True,
         report_to=["tensorboard"], # save the training process to tensorboard
@@ -247,22 +261,29 @@ for label in labels_list:
     trainer.train()
 
 
-    # Test dataset
-    # len_test = len(test_index)
-    len_test = len(y_test)
-    print("Test datasets length:" + str(len_test))
+
+    model.save_pretrained(os.path.join(output_dir,'model/lora_adapter'), save_adapters_only=True)
+
+    # 测试阶段
+    predictions = []
+    y_true = []
+    
+    # 构建测试提示
+    test_messages = []
+    for x in x_test:
+        test_messages.append([
+            {"role": "system", "content": f"As an expert in {antimicrobial} resistance prediction, analyze the case and respond with 'Prediction: 0' for susceptible or 'Prediction: 1' for resistant."},
+            {"role": "user", "content": f"Patient features: {x}"}
+        ])
+    
+    # 进行预测
     y_label = []
     y_pred = []
-    for i in range(0,len_test,1):
-        instruction = f"You are an expert in prediction of antimicrobial resistance for {antimicrobial}, and you will receive patients’ electronic health record features. Please output the prediction results.",
-        feature = antimicrobial +": " + x_test[i]
-        message = [
-            {"role": "system", "content": f"{instruction}"},
-            {"role": "user", "content": f"{feature}"},
-        ]
-        response = predict(message, model, tokenizer)
-        y_pred.append(int(float(response)))
+    for i, msg in enumerate(test_messages):
+        pred = predict_without_reason(msg, model, tokenizer)
+        y_pred.append(int(float(pred)))
         y_label.append(int(float(y_test[i])))
+
 
     # Statistics
     cm = confusion_matrix(y_label,y_pred)
@@ -270,8 +291,8 @@ for label in labels_list:
     TN = cm[0][0]
     FP = cm[0][1]
     FN = cm[1][0]
-    pre = (TP)/(TP+FP)
-    rec = (TP)/(TP+FN)
+    pre = TP / (TP + FP) if (TP + FP) != 0 else 0
+    rec = (TP)/(TP+FN) if (TP + FN) != 0 else 0
     acc = (TP + TN) / (TP + FN + TN + FP)
     sensitivity = TP / (TP + FN) if (TP + FN) > 0 else 0
     specificity = TN / (TN + FP) if (TN + FP) > 0 else 0

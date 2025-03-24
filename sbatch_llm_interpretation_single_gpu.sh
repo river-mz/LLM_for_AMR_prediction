@@ -17,14 +17,13 @@
 
 (
     while true; do
-        nvidia-smi >> gpu_usage_march_15.log
+        nvidia-smi >> gpu_usage_march_21s.log
         sleep 60  # record the GPU utilization 
     done
 ) &
 MONITOR_PID=$!
 # conda activate data
 # echo "This job ran on $SLURM_NODELIST dated `date`";
-python llm_generation_predict.py --labels resistance_nitrofurantoin &> output_March_22_gen.txt
-# python llm_generation_predict_interpretation.py --labels resistance_nitrofurantoin &> output_March_15_gen_interpret.txt
+python load_train_for_pred_with_test_label.py --label resistance_nitrofurantoin &> output_March_21_interpretation.txt
 
 kill $MONITOR_PID
