@@ -2,3 +2,11 @@
 *.out
 *.log
 test.ipynb
+output/
+output_march_21/
+output_march22_gen_predict/
+output_my_training_Feb24_nt_final/
+pred_interpretation_output/
+qwen/
+*gen_interpret.txt
+*gen.txt
